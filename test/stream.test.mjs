@@ -211,6 +211,7 @@ function transformedArgs(out) {
     return {
       on: (event, handler, opts) => { handlers.push({ event, handler, opts }); return () => {} },
       get: (name) => name === 'ptcRuntime' ? runtime : undefined,
+      systemPrompt: { tools: () => () => {} },
       __stream: () => handlers.find(h => h.event === 'llm/stream').handler,
     }
   }
@@ -380,6 +381,7 @@ function transformedArgs(out) {
     const ctx = {
       on: (event, handler) => { handlers.push({ event, handler }); return () => {} },
       get: () => undefined,
+      systemPrompt: { tools: () => () => {} },
     }
     apply(ctx, config)
     const stream = handlers.find(h => h.event === 'llm/stream').handler

@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "PTC direct calls",
-    "description": "Canonicalizes stray model-direct calls into run_code programs in PTC sessions and tells the model to prefer direct calls when arguments would need escaping."
+    "description": "Declares the escaping-prone tools in PTC requests so the model can call them directly, rewrites those calls into run_code programs, and tells the model when to prefer one."
   }
 }

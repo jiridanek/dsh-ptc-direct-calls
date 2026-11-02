@@ -9,11 +9,13 @@
 # Long-running tools such as workflow run under run_code's wall-clock ceiling
 # once called directly (see DSH discussion #5822), so list them out if needed.
 #
-# In PTC prompt assemblies the plugin restates the shipped tools:ptc-only
-# instruction and inserts a tools:direct-calls section telling the model to
-# call a tool directly whenever its arguments would otherwise have to be
-# escaped into a program (file contents, patches, code, and text with
-# backticks, ${...}, quotes, or backslashes), naming write, edit, and bash explicitly.
+# A model can only call declared tools, so the plugin also declares the
+# escaping-prone ones in PTC requests (config.declare, default write/edit/bash)
+# and rewrites their calls into programs. The shipped tools:ptc-only
+# instruction is restated and a tools:direct-calls section tells the model to
+# prefer a direct call when arguments would otherwise need escaping (file
+# contents, patches, code, and text with backticks, ${...}, quotes, or
+# backslashes). `declare: []` keeps the plugin as a pure safety net.
 - insert:
     - id: ptc-direct-calls
       name: dsh-ptc-direct-calls

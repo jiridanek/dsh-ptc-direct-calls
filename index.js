@@ -37,7 +37,17 @@
  *
  * Calls that do not meet every condition pass through untouched, and the
  * host's normal `run_code`-only denial remains the backstop. The plugin adds
- * no tools and no permissions; its wire cost is zero.
+ * no tools and no permissions. Declaring schemas does cost context, which is
+ * why the default declares the three escaping-prone tools rather than the
+ * whole native surface.
+ *
+ * Direct-call declaration: a model can only call the tools its request
+ * declares, so a prompt invitation alone cannot produce a direct call. In a
+ * PTC scope the plugin adds the schemas of the escaping-prone tools (default
+ * `write`, `edit`, `bash`) to the request through a `systemPrompt.tools`
+ * provider; each such call is then canonicalized by the stream half before
+ * dispatch. The declaration is skipped for a native executor, whose own
+ * schemas are already declared.
  *
  * Prompt advertising: in a PTC session the plugin (a) rewrites the shipped
  * `tools:ptc-only` instruction so it stops claiming that a direct call fails,
@@ -70,28 +80,41 @@ import z from '@deepseek-ai/schemastery'
 export const name = 'ptc-direct-calls'
 
 /**
- * `llm` is injected so activation waits for the core LLM service whose global
- * `llm/stream` waterfall is observed. The prompt half needs no injection: it
- * observes the `system-prompt/assemble` event, and `ptcRuntime` is read
- * optionally at stream time.
+ * `llm` gates activation on the core LLM service whose global `llm/stream`
+ * waterfall is observed; `systemPrompt` and `tools` are required because the
+ * declaration provider reads the executor projection and visible schemas.
+ * `ptcRuntime` is read optionally at stream time.
  */
-export const inject = ['llm']
+export const inject = ['llm', 'systemPrompt', 'tools']
 
 /** The allowlist entry that means "every tool". */
 const ALL_TOOLS = '*'
+
+const DEFAULT_DECLARED = ['write', 'edit', 'bash']
 
 /** Plugin config. */
 export const Config = z.object({
   /**
    * Tool names a model-direct call may be canonicalized into the equivalent
    * `run_code` program. The default `['*']` allows every tool; list real names
-   * to restrict, or use `[]` to disable the plugin. A listed name is also the
-   * only declaration another plugin may add to the wire view without disabling
-   * salvage. Long-running tools execute under `run_code`'s wall-clock ceiling,
-   * so list them out if that budget is too short for them.
+   * to restrict, or use `[]` to disable canonicalization. A listed name is also
+   * the only declaration another plugin may add to the wire view without
+   * disabling salvage. Long-running tools execute under `run_code`'s wall-clock
+   * ceiling, so list them out if that budget is too short for them.
    */
   tools: z.array(z.string()).default([ALL_TOOLS]).description(
     "Tools that may be called directly and translated into run_code. Default ['*'] allows every tool.",
+  ),
+  /**
+   * Tools whose schemas are added to a PTC request so the model can actually
+   * emit a direct call. Models only call declared tools, so this is the
+   * affordance the prompt advertises; the stream rewrite then turns each call
+   * into the equivalent program. `['*']` declares every visible allowlisted
+   * tool (the native surface, expensive); `[]` disables the affordance and
+   * leaves the plugin as a safety net for stray calls.
+   */
+  declare: z.array(z.string()).default(DEFAULT_DECLARED).description(
+    "Tools declared to the model in PTC requests so direct calls are emittable. Default ['write','edit','bash']; '*' declares every visible allowlisted tool; [] disables it.",
   ),
 })
 
@@ -109,26 +132,26 @@ function listedTools(allowed) {
 }
 
 /** The subject of a direct-call sentence: every tool, or the allowlisted names. */
-function directCallSubject(allowed) {
-  return allowed === undefined ? 'any tool' : listedTools(allowed)
+function directCallSubject(names) {
+  return names === undefined ? 'any tool' : listedTools(names)
 }
 
 /** Sentence-initial form of the subject. */
-function directCallSubjectSentence(allowed) {
-  const subject = directCallSubject(allowed)
+function directCallSubjectSentence(names) {
+  const subject = directCallSubject(names)
   return subject.charAt(0).toUpperCase() + subject.slice(1)
 }
 
-/** Named escaping cases; only the ones the allowlist permits are advertised. */
+/** Named escaping cases; only the ones actually declared are advertised. */
 const DIRECT_CALL_EXAMPLES = [
   ['write', 'to create or fully replace a file'],
   ['edit', 'for a targeted change'],
   ['bash', 'for a command whose quoting you would otherwise have to escape inside a program'],
 ]
 
-/** The concrete examples, naming only the tools the allowlist actually permits. */
-function directCallExamples(allowed) {
-  const permitted = DIRECT_CALL_EXAMPLES.filter(([name]) => allowed === undefined || allowed.has(name))
+/** The concrete examples, naming only the tools that are actually declared. */
+function directCallExamples(names) {
+  const permitted = DIRECT_CALL_EXAMPLES.filter(([name]) => names === undefined || names.has(name))
   if (permitted.length === 0) return ''
   const parts = permitted.map(([name, purpose], index) =>
     `${index === 0 ? 'call ' : ''}\`${name}\` directly ${purpose}`)
@@ -144,9 +167,9 @@ function directCallExamples(allowed) {
  * true for the tools this plugin translates, so the whole instruction is
  * restated while keeping the SDK pointer that follows it.
  */
-function amendedPtcOnlyText(allowed) {
+function amendedPtcOnlyText(names) {
   return `\`${RUN_CODE_NAME}\` is the tool for multi-step work. `
-    + `${directCallSubjectSentence(allowed)} may also be called directly: a direct call is `
+    + `${directCallSubjectSentence(names)} may also be called directly: a direct call is `
     + `transparently translated into the equivalent \`${RUN_CODE_NAME}\` program `
     + '(see Direct tool calls below). Reach every tool the SDK declares below from inside a program, '
     + 'or call one directly when that keeps its arguments readable.'
@@ -158,14 +181,14 @@ function amendedPtcOnlyText(allowed) {
  * The tools' own parameters are already typed in the SDK section, so they are
  * not repeated here.
  */
-function directCallsText(allowed) {
-  return `Direct tool calls: you may call ${directCallSubject(allowed)} directly instead of writing `
+function directCallsText(names) {
+  return `Direct tool calls: you may call ${directCallSubject(names)} directly instead of writing `
     + 'a `run_code` program for one invocation. A direct call is translated mechanically into the '
     + 'equivalent program, with its arguments carried as JSON — they never pass through a JavaScript '
     + 'string literal. Prefer a direct call whenever the arguments would be painful to escape in a '
     + 'program: file contents, patches, code, prompts, or any text containing backticks, `${...}`, '
     + 'quotes, or backslashes. '
-    + directCallExamples(allowed)
+    + directCallExamples(names)
     + 'A translated call is equivalent to the same call inside a program: argument validation, '
     + 'sandbox, and approvals still apply. Use `run_code` for multi-step work and for tools whose '
     + 'arguments are simple.'
@@ -565,13 +588,13 @@ function presentsPtc(assembly) {
  * Restate the shipped `tools:ptc-only` instruction and insert the advertising
  * section after it. Non-PTC assemblies pass through untouched.
  */
-function advertiseDirectCalls(assembly, allowed) {
+function advertiseDirectCalls(assembly, names) {
   if (!presentsPtc(assembly)) return assembly
   const index = assembly.sections.findIndex(section => section.name === PTC_ONLY_SECTION_NAME)
   if (index < 0) return assembly
   const sections = assembly.sections.map(section => (
     section.name === PTC_ONLY_SECTION_NAME
-      ? { ...section, text: amendedPtcOnlyText(allowed) }
+      ? { ...section, text: amendedPtcOnlyText(names) }
       : section
   ))
   if (sections.some(section => section.name === DIRECT_CALLS_SECTION_NAME)) {
@@ -579,10 +602,50 @@ function advertiseDirectCalls(assembly, allowed) {
   }
   sections.splice(index + 1, 0, {
     name: DIRECT_CALLS_SECTION_NAME,
-    text: directCallsText(allowed),
+    text: directCallsText(names),
     interpolate: false,
   })
   return { ...assembly, sections }
+}
+
+/**
+ * Whether the executor selected for this assembly is the PTC collapse. The
+ * model-facing projection is the only public evidence: a PTC executor describes
+ * exactly `run_code`, while a native executor describes its visible tools.
+ * `selectExecutor` is TypeScript-private; a harness that drops it degrades to
+ * "no direct-call declaration" instead of breaking the plugin.
+ */
+function ptcSelected(ctx, context) {
+  try {
+    const select = ctx.tools.selectExecutor
+    if (typeof select !== 'function') return false
+    const executor = select.call(ctx.tools, context?.scope)
+    const definitions = ctx.tools.definitions(context?.scope, context?.toolSet)
+    const schemas = executor.describe(definitions)?.schemas
+    return Array.isArray(schemas) && schemas.length === 1 && schemas[0]?.name === RUN_CODE_NAME
+  } catch {
+    return false
+  }
+}
+
+/**
+ * The declared names that this assembly can actually offer: the configured
+ * declaration intersect the allowlist and the tools visible in this step.
+ * `undefined` keeps the unrestricted "any tool" wording.
+ */
+function effectiveDeclared(ctx, context, declared, allowed) {
+  if (declared === undefined && allowed === undefined) return undefined
+  let visible
+  try {
+    visible = new Set(ctx.tools.definitions(context?.scope, context?.toolSet).map(definition => definition.name))
+  } catch {
+    visible = undefined
+  }
+  const names = declared === undefined ? allowed : declared
+  return new Set([...names].filter(name => (
+    (allowed === undefined || allowed.has(name))
+    && (visible === undefined || visible.has(name))
+  )))
 }
 
 /**
@@ -606,21 +669,46 @@ function runtimeTarget(ctx) {
 }
 
 /**
- * Observe the global LLM stream and canonicalize direct calls, and advertise
- * them in PTC prompt assemblies.
+ * Observe the global LLM stream and canonicalize direct calls, declare the
+ * escaping-prone tools in PTC requests, and advertise them in PTC prompts.
  * @param ctx - the mounting context.
- * @param config - the optional allowlist; omitted means every tool.
+ * @param config - the optional allowlist and declaration; omitted uses defaults.
  */
 export function apply(ctx, config) {
   const configured = config.tools ?? [ALL_TOOLS]
   const allowed = configured.includes(ALL_TOOLS) ? undefined : new Set(configured)
-  const hasDirectCalls = allowed === undefined || allowed.size > 0
+  const declaredConfig = config.declare ?? DEFAULT_DECLARED
+  const declared = declaredConfig.includes(ALL_TOOLS) ? undefined : new Set(declaredConfig)
+  const isAllowed = name => allowed === undefined || allowed.has(name)
+  const isDeclared = name => declared === undefined || declared.has(name)
+  const hasDeclaration = declared === undefined || declared.size > 0
+
   ctx.on('llm/stream', (options, next) => canonicalizeToolCallStream(next(), {
     tools: options?.tools,
     allowed,
     ...runtimeTarget(ctx),
   }), { global: true })
-  ctx.on('system-prompt/assemble', (assembly, _context, next) => (
-    next().then(assembled => hasDirectCalls ? advertiseDirectCalls(assembled, allowed) : assembled)
+
+  // Models only call declared tools: put the escaping-prone ones on the wire so
+  // a direct call is an affordance, not a hope. The stream rewrite above turns
+  // each such call into the equivalent program before dispatch.
+  ctx.systemPrompt.tools((context) => {
+    if (!hasDeclaration || !ptcSelected(ctx, context)) return { schemas: [] }
+    try {
+      const schemas = ctx.tools.schemas(context?.scope, context?.toolSet)
+        .filter(schema => isDeclared(schema.name) && isAllowed(schema.name))
+      return { schemas }
+    } catch {
+      return { schemas: [] }
+    }
+  })
+
+  ctx.on('system-prompt/assemble', (assembly, context, next) => (
+    next().then(assembled => {
+      if (!hasDeclaration) return assembled
+      const names = effectiveDeclared(ctx, context, declared, allowed)
+      if (names !== undefined && names.size === 0) return assembled
+      return advertiseDirectCalls(assembled, names)
+    })
   ))
 }
