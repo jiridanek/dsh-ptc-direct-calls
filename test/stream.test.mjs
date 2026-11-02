@@ -231,4 +231,74 @@ function transformedArgs(out) {
   console.log('15. apply() forwards the runtime target: OK')
 }
 
-console.log('\nAll 15 tests passed.')
+// 16. Ambiguous tools.-qualified name never resolves; a lone member still does
+{
+  const raw = JSON.stringify({ command: 'npm test' })
+  const input = [...writeCallChunks(raw, { name: 'tools.pwsh', id: 'call_16' }), { type: 'finish', reason: 'stop' }]
+  const out = await collect(of(input), { tools: PTC, allowed: ['pwsh', 'tools.pwsh'] })
+  assert.deepEqual(out, input, 'a name matching two allowlisted tools stays native')
+  const member = [...writeCallChunks(raw, { name: 'tools.pwsh', id: 'call_16b' }), { type: 'finish', reason: 'stop' }]
+  const { code } = transformedArgs(await collect(of(member), { tools: PTC, allowed: ['pwsh'] }))
+  assert.ok(code.includes('tools.pwsh('), 'single member match resolves')
+  console.log('16. ambiguous tools.-qualified name passes through: OK')
+}
+
+// 17. Non-identifier tool names use bracket access
+{
+  const raw = JSON.stringify({ value: true })
+  const out = await collect(of([...writeCallChunks(raw, { name: 'tool-name', id: 'call_17' }), { type: 'finish', reason: 'stop' }]), {
+    tools: PTC, allowed: ['tool-name'],
+  })
+  const { code } = transformedArgs(out)
+  assert.ok(code.includes('tools["tool-name"]('), code)
+  const unicode = await collect(of([...writeCallChunks(raw, { name: '工具', id: 'call_17b' }), { type: 'finish', reason: 'stop' }]), {
+    tools: PTC, allowed: ['工具'],
+  })
+  assert.ok(transformedArgs(unicode).code.includes('tools.工具('))
+  console.log('17. identifier vs bracket access: OK')
+}
+
+// 18. Untouched provider replay metadata stays authoritative
+{
+  const raw = JSON.stringify({ command: 'ls' })
+  const input = [
+    ...writeCallChunks(raw, { name: 'bash', id: 'call_18' }),
+    { type: 'finish', reason: 'stop', replayState: { response: { provider: 'opaque' }, blocks: [] } },
+  ]
+  assert.deepEqual(await collect(of(input), { tools: PTC, allowed }), input)
+  console.log('18. untouched replayState preserved: OK')
+}
+
+// 19. An incomplete candidate is flushed unchanged before a stream failure
+{
+  const failure = new Error('provider failed')
+  const source = async function* () {
+    yield { type: 'block-start', index: 0, blockType: 'tool-call' }
+    yield { type: 'tool-call-delta', index: 0, id: 'partial', name: 'write', argumentsDelta: '{"file_path":"partial' }
+    throw failure
+  }
+  const observed = []
+  await assert.rejects(async () => {
+    for await (const chunk of canonicalizeToolCallStream(source(), { tools: PTC, allowed })) observed.push(chunk)
+  }, error => error === failure)
+  assert.deepEqual(observed.map(chunk => chunk.type), ['block-start', 'tool-call-delta'])
+  assert.equal(observed[1].name, 'write', 'the partial native call is not rewritten')
+  console.log('19. partial candidate flushed before a stream failure: OK')
+}
+
+// 20. A later unfinished call cannot restore replay state after an earlier rewrite
+{
+  const first = writeCallChunks(JSON.stringify({ file_path: 'one' }), { id: 'call_20a' })
+  const trailing = [
+    { type: 'block-start', index: 1, blockType: 'tool-call' },
+    { type: 'tool-call-delta', index: 1, id: 'call_20b', name: 'write', argumentsDelta: '{' },
+    { type: 'finish', reason: 'stop', replayState: { opaque: 'old-provider-state' } },
+  ]
+  const out = await collect(of([...first, ...trailing]), { tools: PTC, allowed })
+  assert.equal(out.find(chunk => chunk.type === 'block-end').block.name, 'run_code')
+  assert.equal(out.find(chunk => chunk.type === 'tool-call-delta' && chunk.index === 1).argumentsDelta, '{')
+  assert.ok(!('replayState' in out.at(-1)), 'stale replay state is dropped')
+  console.log('20. unfinished trailing call cannot restore replayState: OK')
+}
+
+console.log('\nAll 20 tests passed.')

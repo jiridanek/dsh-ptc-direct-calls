@@ -263,18 +263,20 @@ function acceptsProgramTarget(options) {
 }
 
 /**
- * Resolve one emitted call name against the fixed allowlist. A plain name
- * and its `tools.`-prefixed form each resolve to at most one allowlisted
- * tool, so a match is always unique.
+ * Resolve one emitted call name against the fixed allowlist without guessing.
+ * A plain name and its `tools.`-prefixed form are different tools, so a name
+ * that matches both is ambiguous and never resolves — the same refusal the
+ * adapted canonicalizer applies to a schema-proven Map.
  */
 function resolveAllowedName(name, allowed) {
   if (typeof name !== 'string' || name.length === 0) return undefined
-  if (allowed.has(name)) return name
+  const matches = new Set()
+  if (allowed.has(name)) matches.add(name)
   if (name.startsWith('tools.')) {
     const member = name.slice('tools.'.length)
-    if (member.length > 0 && !member.includes('.') && allowed.has(member)) return member
+    if (member.length > 0 && !member.includes('.') && allowed.has(member)) matches.add(member)
   }
-  return undefined
+  return matches.size === 1 ? matches.values().next().value : undefined
 }
 
 function extractCall(chunks, index) {
