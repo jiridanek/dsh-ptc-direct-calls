@@ -10,11 +10,13 @@
  * documented in DSH discussions #3925 / #4699 / #7618).
  *
  * This plugin closes that gap at the one point a plugin can still see the
- * call: the global `llm/stream` waterfall. When the request's model-facing
- * tool view is exactly `[run_code]` (i.e. the agent really presents PTC mode)
- * and the model emits a direct call whose name uniquely resolves against the
- * configured allowlist (default: `write`) with JSON-parseable arguments, the
- * stream chunk is rewritten in place into the equivalent `run_code` program:
+ * call: the global `llm/stream` waterfall. When the request declares
+ * `run_code` and nothing outside the configured allowlist — a second direct
+ * tool another plugin presents therefore does not disable salvage, while an
+ * unvetted extra keeps the stream untouched — and the model emits a direct
+ * call whose name uniquely resolves against that allowlist (default: `write`)
+ * with JSON-parseable arguments, the stream chunk is rewritten in place into
+ * the equivalent `run_code` program:
  *
  *     { return await tools.write(<arguments>) }
  *
@@ -243,13 +245,18 @@ function nativeCallCode(name, rawArgs, parsedArgs) {
 }
 
 /**
- * The request presents exactly the PTC transport view: a single tool,
- * `run_code`. Any other view (native, `both`, deferred additions) leaves the
- * stream untouched.
+ * The request presents a PTC transport view: `run_code` is declared, and every
+ * other declared name is a tool the allowlist already governs. A second direct
+ * tool another plugin presents therefore keeps salvage alive instead of
+ * disabling it, while an unvetted extra (`bash`, `read`) or a malformed,
+ * duplicated declaration leaves the stream untouched.
  */
-function acceptsTransportView(tools) {
-  if (!Array.isArray(tools) || tools.length !== 1) return false
-  return tools[0]?.name === RUN_CODE_NAME
+function acceptsTransportView(tools, allowed) {
+  if (!Array.isArray(tools) || tools.length === 0) return false
+  const names = tools.map(tool => tool?.name)
+  if (names.includes(undefined) || new Set(names).size !== names.length) return false
+  if (!names.includes(RUN_CODE_NAME)) return false
+  return names.every(name => name === RUN_CODE_NAME || allowed.has(name))
 }
 
 /**
@@ -395,14 +402,11 @@ function transformCandidates(chunks, indices, allowed, allowDeltaOnly = false) {
  * pass through unchanged for the host to diagnose.
  */
 export async function* canonicalizeToolCallStream(source, options = {}) {
-  if (!acceptsTransportView(options.tools) || !acceptsProgramTarget(options)) {
-    yield* source
-    return
-  }
   const allowed = options.allowed instanceof Set
     ? options.allowed
     : new Set(Array.isArray(options.allowed) ? options.allowed : [])
-  if (allowed.size === 0) {
+  if (allowed.size === 0 || !acceptsTransportView(options.tools, allowed)
+    || !acceptsProgramTarget(options)) {
     yield* source
     return
   }

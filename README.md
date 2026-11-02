@@ -62,9 +62,12 @@ executor is selected for the assembly's scope. The plugin therefore treats a **n
 listener, and inserts the advertising section immediately after the amended instruction. A native
 assembly (empty marker, or no marker at all) passes through by identity.
 
-The stream half keeps its own precise gate: `GenerateOptions.tools` must be exactly
-`[{ name: 'run_code' }]`. It additionally requires that the live `ptcRuntime` (read optionally
-via `ctx.get('ptcRuntime')`) still accepts a **TypeScript async function body**, because the
+The stream half gates on the declared tool view: `run_code` must be present, every other declared
+name must be in the allowlist, and a malformed or duplicated declaration is refused. A second
+direct tool that another plugin presents therefore keeps salvage alive once the profile allowlists
+it, while an unvetted extra (`bash`, `read`), a native-only view, or a full "both" surface leaves
+the stream untouched. It also requires that the live `ptcRuntime` (read optionally via
+`ctx.get('ptcRuntime')`) still accepts a **TypeScript async function body**, because the
 canonicalizer emits a function body. A runtime reporting another language (the experimental
 Python backend) or program format (REPL/script) leaves the stream untouched; an absent runtime
 keeps the historical TypeScript assumption, so a runtime mounted in a narrower scope cannot
@@ -113,7 +116,8 @@ npm test
 ```
 
 Covers: content round-trip (backticks, `${}`, invalid JS escapes, `__proto__`, 130-level
-nesting), passthrough gates (disallowed tool, malformed JSON, non-PTC view, unknown name, empty
+nesting), passthrough gates (disallowed tool, malformed JSON, native-only and mixed views,
+allowlisted vs unvetted extra declarations, duplicated declarations, unknown name, empty
 allowlist, non-TypeScript runtime, non-function-body program format), mixed streams, stale
 `replayState` stripping, and the prompt amendment/advertising gating (current presentation
 shape, native mode, no marker, no duplicate section, reworded upstream instruction fallback).

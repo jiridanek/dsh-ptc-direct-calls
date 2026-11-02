@@ -301,4 +301,52 @@ function transformedArgs(out) {
   console.log('20. unfinished trailing call cannot restore replayState: OK')
 }
 
-console.log('\nAll 20 tests passed.')
+// 21. A second allowlisted direct tool keeps salvage alive
+{
+  const args = { file_path: '/tmp/second', content: 'x' }
+  const raw = JSON.stringify(args)
+  const out = await collect(of([...writeCallChunks(raw, { id: 'call_21' }), { type: 'finish', reason: 'stop' }]), {
+    tools: [{ name: 'run_code' }, { name: 'apply_patch' }],
+    allowed: ['write', 'apply_patch'],
+  })
+  const { code } = transformedArgs(out)
+  await runGenerated(code, args)
+  console.log('21. second allowlisted direct tool keeps salvage: OK')
+}
+
+// 22. An extra declaration outside the allowlist still disables salvage
+{
+  const raw = JSON.stringify({ file_path: '/tmp/x' })
+  const input = [...writeCallChunks(raw, { id: 'call_22' }), { type: 'finish', reason: 'stop' }]
+  const out = await collect(of(input), { tools: [{ name: 'run_code' }, { name: 'apply_patch' }], allowed })
+  assert.deepEqual(out, input)
+  const duplicated = [...writeCallChunks(raw, { id: 'call_22b' }), { type: 'finish', reason: 'stop' }]
+  assert.deepEqual(
+    await collect(of(duplicated), { tools: [{ name: 'run_code' }, { name: 'run_code' }], allowed }),
+    duplicated,
+    'a duplicated declaration is not a PTC view',
+  )
+  console.log('22. unvetted extra declaration disables salvage: OK')
+}
+
+// 23. A mixed surface with an unvetted extra stays untouched
+{
+  const raw = JSON.stringify({ file_path: '/tmp/x' })
+  const input = [...writeCallChunks(raw, { id: 'call_23' }), { type: 'finish', reason: 'stop' }]
+  assert.deepEqual(await collect(of(input), { tools: [{ name: 'run_code' }, { name: 'bash' }], allowed }), input)
+  console.log('23. mixed surface stays untouched: OK')
+}
+
+// 24. A declared allowlisted tool is still canonicalized, like any other extra
+{
+  const raw = JSON.stringify({ file_path: '/tmp/declared' })
+  const out = await collect(of([...writeCallChunks(raw, { id: 'call_24' }), { type: 'finish', reason: 'stop' }]), {
+    tools: [{ name: 'run_code' }, { name: 'write' }],
+    allowed,
+  })
+  const { code } = transformedArgs(out)
+  assert.ok(code.includes('tools.write('), code)
+  console.log('24. declared allowlisted tool canonicalized: OK')
+}
+
+console.log('\nAll 24 tests passed.')
