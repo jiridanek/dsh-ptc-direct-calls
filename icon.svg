@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" role="img" aria-label="Direct file write">
+  <rect width="24" height="24" rx="5" fill="#1d4ed8"/>
+  <path d="M12 4.4v8.2" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round"/>
+  <path d="M8.7 9.4 12 12.8l3.3-3.4" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M5.9 15.7v2.3c0 .9.7 1.6 1.6 1.6h9c.9 0 1.6-.7 1.6-1.6v-2.3" fill="none" stroke="#bfdbfe" stroke-width="2" stroke-linecap="round"/>
+</svg>

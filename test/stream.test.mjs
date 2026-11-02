@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor
-import { canonicalizeToolCallStream } from '../index.js'
+import { apply, canonicalizeToolCallStream } from '../index.js'
 
 const PTC = [{ name: 'run_code' }]
 const allowed = ['write']
@@ -174,4 +174,61 @@ function transformedArgs(out) {
   console.log('11. empty allowlist no-op: OK')
 }
 
-console.log('\nAll 11 tests passed.')
+// 12. Non-TypeScript runtime (experimental Python backend) passes through
+{
+  const raw = JSON.stringify({ file_path: '/tmp/x' })
+  const input = [...writeCallChunks(raw, { id: 'call_12' }), { type: 'finish', reason: 'stop' }]
+  const out = await collect(of(input), { tools: PTC, allowed, language: 'python', programFormat: 'function-body' })
+  assert.deepEqual(out, input)
+  console.log('12. python runtime passes through: OK')
+}
+
+// 13. TypeScript REPL/script program format passes through (no function body)
+{
+  const raw = JSON.stringify({ file_path: '/tmp/x' })
+  const input = [...writeCallChunks(raw, { id: 'call_13' }), { type: 'finish', reason: 'stop' }]
+  const out = await collect(of(input), { tools: PTC, allowed, language: 'typescript', programFormat: 'repl' })
+  assert.deepEqual(out, input)
+  console.log('13. repl program format passes through: OK')
+}
+
+// 14. Explicit TypeScript function body still transforms
+{
+  const args = { file_path: '/tmp/explicit', content: 'x' }
+  const raw = JSON.stringify(args)
+  const out = await collect(of([...writeCallChunks(raw, { id: 'call_14' }), { type: 'finish', reason: 'stop' }]), {
+    tools: PTC, allowed, language: 'typescript', programFormat: 'function-body',
+  })
+  const { code } = transformedArgs(out)
+  await runGenerated(code, args)
+  console.log('14. explicit typescript function body transforms: OK')
+}
+
+// 15. apply() forwards the live runtime target to the stream listener
+{
+  const makeCtx = (runtime) => {
+    const handlers = []
+    return {
+      on: (event, handler, opts) => { handlers.push({ event, handler, opts }); return () => {} },
+      get: (name) => name === 'ptcRuntime' ? runtime : undefined,
+      __stream: () => handlers.find(h => h.event === 'llm/stream').handler,
+    }
+  }
+  const args = { file_path: '/tmp/applied', content: 'x' }
+  const raw = JSON.stringify(args)
+  const input = () => [...writeCallChunks(raw, { id: 'call_15' }), { type: 'finish', reason: 'stop' }]
+
+  const pythonCtx = makeCtx({ language: 'python', programFormat: 'function-body' })
+  apply(pythonCtx, { tools: ['write'] })
+  const untouched = await collect(pythonCtx.__stream()({ tools: PTC }, () => of(input())), {})
+  assert.deepEqual(untouched, input(), 'python runtime keeps the native call')
+
+  const unknownCtx = makeCtx(undefined)
+  apply(unknownCtx, { tools: ['write'] })
+  const transformed = await collect(unknownCtx.__stream()({ tools: PTC }, () => of(input())), {})
+  const { code } = transformedArgs(transformed)
+  await runGenerated(code, args)
+  console.log('15. apply() forwards the runtime target: OK')
+}
+
+console.log('\nAll 15 tests passed.')

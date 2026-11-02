@@ -1,13 +1,14 @@
 # Canonicalize stray model-direct calls of allowlisted tools (default: write)
 # into the equivalent run_code program, PTC sessions only (request view is
-# exactly [run_code]). Keep workflow OUT of the list: a converted workflow call
-# would run under run_code's wall-clock ceiling (see DSH discussion #5822).
+# exactly [run_code], and the live ptcRuntime must still accept a TypeScript
+# async function body). Keep workflow OUT of the list: a converted workflow
+# call would run under run_code's wall-clock ceiling (see DSH discussion #5822).
 #
 # While `write` is in the list, the plugin also advertises the direct call in
-# PTC prompt assemblies: it rewrites the shipped tools:ptc-only instruction to
-# carve out the write exception and renders a tools:direct-write section with
-# the full parameter list (file content travels as a JSON argument, so there
-# is no escaping).
+# PTC prompt assemblies: its system-prompt/assemble listener rewrites the
+# shipped tools:ptc-only instruction to carve out the write exception and
+# inserts a tools:direct-write section after it with the full parameter list
+# (file content travels as a JSON argument, so there is no escaping).
 - insert:
     - id: ptc-direct-calls
       name: dsh-ptc-direct-calls

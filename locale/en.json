@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "PTC direct calls",
+    "description": "Canonicalizes stray model-direct calls of allowlisted tools into run_code programs in PTC sessions and advertises the direct write call in the prompt."
+  }
+}

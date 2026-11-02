@@ -12,13 +12,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Node >= 20.6 (module.register); 22 and 24 are the LTS pair.
-        node-version: [22, 24]
+        # dsh requires Node >= 24.9.0; 24 is the LTS line and 26 the current one.
+        node-version: [24, 26]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
       # Self-contained: the @deepseek-ai/schemastery import is stubbed by a
-      # module-resolution hook, no dependencies to install.
+      # module-resolution hook (module.registerHooks), no dependencies to install.
       - run: npm test
+      # The manifest is read by the dsh bundle loader and the plugin manager;
+      # fail here rather than at profile boot.
+      - run: node -e "JSON.parse(require('node:fs').readFileSync('package.json')); JSON.parse(require('node:fs').readFileSync('locale/en.json'))"

@@ -26,17 +26,34 @@
  * literal; schema validation and all governance (sandbox, approval, policy
  * waterfalls) still apply to the nested sub-dispatch inside `run_code`.
  *
+ * That program is a TypeScript async function body, so canonicalization runs
+ * only while the active `ptcRuntime` still accepts that shape. A runtime that
+ * reports another language (e.g. the experimental Python backend) or another
+ * program format (REPL/script) is left untouched: the host's `run_code`-only
+ * denial remains the backstop, exactly as when the plugin is absent. A runtime
+ * provided in a narrower scope than this plugin is not visible here; absence
+ * therefore keeps the historical TypeScript function-body assumption.
+ *
  * Calls that do not meet every condition pass through untouched, and the
  * host's normal `run_code`-only denial remains the backstop. The plugin adds
  * no tools and no permissions; its wire cost is zero.
  *
  * Prompt advertising: in a PTC session the plugin (a) rewrites the shipped
  * `tools:ptc-only` instruction so it carves out the `write` exception instead
- * of contradicting it, and (b) renders a `tools:direct-write` section in the
- * write slot advertising the direct call with its full parameter list — the
+ * of contradicting it, and (b) inserts a `tools:direct-write` section right
+ * after it, advertising the direct call with its full parameter list — the
  * file content travels as a JSON argument, so there is no escaping. Every
  * other tool stays reachable only from inside a `run_code` program. The
  * advertising is active only while `write` is in the allowlist.
+ *
+ * Since dsh 0.2.x an assembly waterfall carries `PromptPresentation` (text
+ * only): tool declarations are provider-owned and `tools.schemas()` reports
+ * registered definitions rather than the executor's model-facing projection.
+ * PTC mode is therefore detected the only way that survives both splits — by
+ * the resolved text of the executor-owned `tools:ptc-only` section, which is
+ * non-empty exactly while the PTC executor is selected for that assembly's
+ * scope. Both prompt mutations happen inside one `system-prompt/assemble`
+ * listener, so no section registration can disagree with the amendment.
  *
  * The stream-rewriting core is adapted (MIT) from the call canonicalizer of
  * dsh-ptc-plus (https://github.com/muyuanjin/dsh-ptc-plus), Copyright (c) 2026
@@ -52,10 +69,11 @@ export const name = 'ptc-direct-calls'
 
 /**
  * `llm` is injected so activation waits for the core LLM service whose global
- * `llm/stream` waterfall is observed; `tools` and `systemPrompt` provide the
- * scope view and section registration for the prompt advertising.
+ * `llm/stream` waterfall is observed. The prompt half needs no injection: it
+ * observes the `system-prompt/assemble` event, and `ptcRuntime` is read
+ * optionally at stream time.
  */
-export const inject = ['llm', 'tools', 'systemPrompt']
+export const inject = ['llm']
 
 /** Plugin config. */
 export const Config = z.object({
@@ -71,11 +89,15 @@ export const Config = z.object({
 const RUN_CODE_NAME = 'run_code'
 const MAX_DIRECT_LITERAL_DEPTH = 128
 const PTC_ONLY_SECTION_NAME = 'tools:ptc-only'
+const DIRECT_WRITE_SECTION_NAME = 'tools:direct-write'
+
+/** The marker sentence the shipped instruction keeps across dsh minor versions. */
+const PTC_ONLY_MARKER = 'is the only tool you can call directly'
 
 /**
- * The shipped `tools:ptc-only` instruction with the `write` exception carved
- * out. Kept as close to the shipped wording as possible so the rule's
- * authority and the SDK pointer survive the amendment.
+ * Fallback amendment used when the shipped wording no longer contains
+ * {@link PTC_ONLY_MARKER}. Kept as close to the shipped instruction as possible
+ * so the rule's authority and the SDK pointer survive the amendment.
  */
 const PTC_ONLY_INSTRUCTION_WITH_DIRECT_WRITE =
   '`run_code` is the only tool you can call directly, except `write`: a direct `write` call is ' +
@@ -84,9 +106,9 @@ const PTC_ONLY_INSTRUCTION_WITH_DIRECT_WRITE =
 
 /**
  * Full advertising of the direct `write` call: behavior, why escaping is a
- * non-issue, the complete parameter list (mirroring the `write` schema,
- * including the sandbox-escalation fields), and the boundaries — every other
- * tool stays inside a `run_code` program.
+ * non-issue, the complete parameter list (mirroring the current `write`
+ * schema, including the sandbox-escalation fields), and the boundaries —
+ * every other tool stays inside a `run_code` program.
  */
 const DIRECT_WRITE_SECTION_TEXT =
   'Direct file writes: you may also call `write` directly — a direct `write` call is transparently ' +
@@ -95,12 +117,12 @@ const DIRECT_WRITE_SECTION_TEXT =
   'string literal. Prefer a direct `write` call over a program that calls tools.write(...) whenever you ' +
   'create or fully replace a file; it removes every escaping worry.\n' +
   'Parameters of the direct `write` call:\n' +
-  '- file_path (string, required): path to write, resolved by the filesystem backend; relative paths resolve against the session workspace.\n' +
-  '- content (string, required): full UTF-8 text content to write; creates the file or fully replaces an existing one, and an empty content writes an empty file.\n' +
-  '- sandbox_permissions (optional, "workspace-write" or "danger-full-access"): the narrowest wider sandbox mode for a one-shot retry of the exact operation the sandbox just denied; the retry asks the user for approval.\n' +
-  '- justification (string, required with sandbox_permissions): one sentence for the user explaining why this exact file operation needs the wider access.\n' +
-  'The result is a short confirmation with the resolved path (created/updated); file content is not echoed back. ' +
-  'Read an existing file before overwriting it, and reach edit from inside a run_code program for targeted changes. ' +
+  '- file_path (string, required): path to write, resolved by the filesystem backend; relative paths resolve against the session working directory. Provide `file_path` before `content` in the arguments.\n' +
+  '- content (string, required): full UTF-8 text content to write; creates the file or fully replaces an existing one. Empty content is valid and writes an empty file.\n' +
+  '- sandbox_permissions (optional; present only when the deployment confines filesystem access, and then one of the deployment\'s escalation modes): the narrowest wider sandbox mode for a one-shot retry of the exact operation the sandbox just denied; the retry asks the user for approval.\n' +
+  '- justification (string, required with sandbox_permissions): one sentence for the user explaining why this exact file operation needs the wider access. Use the language of the user\'s current request.\n' +
+  'The result is a short confirmation with the resolved path and whether the file was created or updated; file content is not echoed back. ' +
+  'Read an existing file before overwriting it, and reach edit (or apply_patch, when the deployment mounts it) from inside a run_code program for targeted changes. ' +
   'Every other tool is reachable only from inside a run_code program.'
 
 function parseArguments(raw) {
@@ -228,6 +250,16 @@ function nativeCallCode(name, rawArgs, parsedArgs) {
 function acceptsTransportView(tools) {
   if (!Array.isArray(tools) || tools.length !== 1) return false
   return tools[0]?.name === RUN_CODE_NAME
+}
+
+/**
+ * Whether the active runtime accepts the TypeScript async function body this
+ * plugin emits. Omitted options mean "unknown, keep the historical shape".
+ */
+function acceptsProgramTarget(options) {
+  if (options.language !== undefined && options.language !== 'typescript') return false
+  if (options.programFormat !== undefined && options.programFormat !== 'function-body') return false
+  return true
 }
 
 /**
@@ -361,7 +393,7 @@ function transformCandidates(chunks, indices, allowed, allowDeltaOnly = false) {
  * pass through unchanged for the host to diagnose.
  */
 export async function* canonicalizeToolCallStream(source, options = {}) {
-  if (!acceptsTransportView(options.tools)) {
+  if (!acceptsTransportView(options.tools) || !acceptsProgramTarget(options)) {
     yield* source
     return
   }
@@ -452,18 +484,75 @@ export async function* canonicalizeToolCallStream(source, options = {}) {
 }
 
 /**
- * Amend the shipped `tools:ptc-only` section of one PTC assembly to carve out
- * the `write` exception. Non-PTC assemblies pass through untouched.
+ * Insert the `write` exception into the shipped instruction without replacing
+ * the rest of its wording. Upstream text that no longer contains the marker
+ * falls back to the pinned amendment.
  */
-function amendPtcOnlyInstruction(assembly, advertise) {
-  if (!advertise || !acceptsTransportView(assembly?.tools)) return assembly
-  return {
-    ...assembly,
-    sections: assembly.sections.map(section => (
+function amendedPtcOnlyText(text) {
+  const at = text.indexOf(PTC_ONLY_MARKER)
+  if (at < 0) return PTC_ONLY_INSTRUCTION_WITH_DIRECT_WRITE
+  const end = at + PTC_ONLY_MARKER.length
+  return `${text.slice(0, end)}, except \`write\`: a direct \`write\` call is transparently `
+    + `translated into the equivalent \`${RUN_CODE_NAME}\` program (see Direct file writes below)`
+    + text.slice(end)
+}
+
+/**
+ * Whether one assembly presents the PTC transport. The PTC executor owns the
+ * `tools:ptc-only` section, and its text stays non-empty exactly while that
+ * executor is selected for the assembly's scope — the marker that survives the
+ * 0.2.x split of tool declarations out of `PromptPresentation`.
+ */
+function presentsPtc(assembly) {
+  return Array.isArray(assembly?.sections)
+    && assembly.sections.some(section => (
       section?.name === PTC_ONLY_SECTION_NAME
-        ? { ...section, text: PTC_ONLY_INSTRUCTION_WITH_DIRECT_WRITE }
-        : section
-    )),
+      && typeof section.text === 'string'
+      && section.text.length > 0
+    ))
+}
+
+/**
+ * Amend the shipped `tools:ptc-only` section and insert the advertising
+ * section after it. Non-PTC assemblies pass through untouched.
+ */
+function advertiseDirectWrite(assembly, advertise) {
+  if (!advertise || !presentsPtc(assembly)) return assembly
+  const index = assembly.sections.findIndex(section => section.name === PTC_ONLY_SECTION_NAME)
+  if (index < 0) return assembly
+  const sections = assembly.sections.map(section => (
+    section.name === PTC_ONLY_SECTION_NAME
+      ? { ...section, text: amendedPtcOnlyText(section.text) }
+      : section
+  ))
+  if (sections.some(section => section.name === DIRECT_WRITE_SECTION_NAME)) {
+    return { ...assembly, sections }
+  }
+  sections.splice(index + 1, 0, {
+    name: DIRECT_WRITE_SECTION_NAME,
+    text: DIRECT_WRITE_SECTION_TEXT,
+    interpolate: false,
+  })
+  return { ...assembly, sections }
+}
+
+/**
+ * The active runtime's program target, read lazily so mounting order does not
+ * matter. A runtime in a narrower scope than this plugin is not visible here;
+ * returning an empty target keeps the historical TypeScript assumption.
+ */
+function runtimeTarget(ctx) {
+  let runtime
+  try {
+    runtime = ctx.get('ptcRuntime')
+  } catch {
+    return { language: 'unavailable' }
+  }
+  if (runtime === undefined) return {}
+  try {
+    return { language: runtime.language, programFormat: runtime.programFormat }
+  } catch {
+    return { language: 'unavailable' }
   }
 }
 
@@ -476,31 +565,12 @@ function amendPtcOnlyInstruction(assembly, advertise) {
 export function apply(ctx, config) {
   const allowed = new Set(config.tools)
   const advertiseWrite = allowed.has('write')
-  const streamDisposer = ctx.on('llm/stream', (options, next) => canonicalizeToolCallStream(next(), {
+  ctx.on('llm/stream', (options, next) => canonicalizeToolCallStream(next(), {
     tools: options?.tools,
     allowed,
+    ...runtimeTarget(ctx),
   }), { global: true })
-  const sectionDisposer = advertiseWrite ? ctx.systemPrompt.section({
-    name: 'tools:direct-write',
-    order: ctx.systemPrompt.getSectionOrder('TOOL_WRITE'),
-    text: (context) => {
-      if (context?.scope === undefined) return ''
-      try {
-        return acceptsTransportView(ctx.tools.schemas(context.scope)) ? DIRECT_WRITE_SECTION_TEXT : ''
-      } catch {
-        return ''
-      }
-    },
-  }) : () => {}
-  const assembleDisposer = ctx.on('system-prompt/assemble', (assembly, context, next) => (
-    next().then(assembled => {
-      if (context?.scope === undefined) return assembled
-      return amendPtcOnlyInstruction(assembled, advertiseWrite)
-    })
+  ctx.on('system-prompt/assemble', (assembly, _context, next) => (
+    next().then(assembled => advertiseDirectWrite(assembled, advertiseWrite))
   ))
-  return () => {
-    streamDisposer()
-    sectionDisposer()
-    assembleDisposer()
-  }
 }

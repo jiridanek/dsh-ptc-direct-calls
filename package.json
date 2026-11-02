@@ -1,10 +1,33 @@
 {
   "name": "dsh-ptc-direct-calls",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "DSH profile plugin: canonicalize stray direct write calls to run_code in PTC sessions and advertise the direct call in the prompt",
   "license": "MIT",
   "type": "module",
   "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./icon": "./icon.svg",
+    "./locale/*.json": "./locale/*.json",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "locale/*.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=24.9.0",
+    "dsh": ">=0.2.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jiridanek/dsh-ptc-direct-calls.git"
+  },
   "scripts": {
     "test": "node --import ./test/register.mjs ./test/run.mjs"
   },
