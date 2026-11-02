@@ -14,9 +14,8 @@
  * `run_code` and nothing outside the configured allowlist — a second direct
  * tool another plugin presents therefore does not disable salvage, while an
  * unvetted extra keeps the stream untouched — and the model emits a direct
- * call whose name uniquely resolves against that allowlist (default: `write`)
- * with JSON-parseable arguments, the stream chunk is rewritten in place into
- * the equivalent `run_code` program:
+ * call of any other tool with JSON-parseable arguments, the stream chunk is
+ * rewritten in place into the equivalent `run_code` program:
  *
  *     { return await tools.write(<arguments>) }
  *
@@ -41,12 +40,13 @@
  * no tools and no permissions; its wire cost is zero.
  *
  * Prompt advertising: in a PTC session the plugin (a) rewrites the shipped
- * `tools:ptc-only` instruction so it carves out the `write` exception instead
- * of contradicting it, and (b) inserts a `tools:direct-write` section right
- * after it, advertising the direct call with its full parameter list — the
- * file content travels as a JSON argument, so there is no escaping. Every
- * other tool stays reachable only from inside a `run_code` program. The
- * advertising is active only while `write` is in the allowlist.
+ * `tools:ptc-only` instruction so it stops claiming that a direct call fails,
+ * and (b) inserts a `tools:direct-calls` section right after it that tells the
+ * model to call a tool directly whenever its arguments would otherwise have to
+ * be escaped into a program — file contents, patches, code, and any text with
+ * backticks, `${...}`, quotes, or backslashes. `write`, `edit`, and `bash` are
+ * named explicitly, but the rule is general. The advertising follows the effective
+ * allowlist: "any tool" when the plugin is unrestricted, or the listed names.
  *
  * Since dsh 0.2.x an assembly waterfall carries `PromptPresentation` (text
  * only): tool declarations are provider-owned and `tools.schemas()` reports
@@ -77,55 +77,99 @@ export const name = 'ptc-direct-calls'
  */
 export const inject = ['llm']
 
+/** The allowlist entry that means "every tool". */
+const ALL_TOOLS = '*'
+
 /** Plugin config. */
 export const Config = z.object({
   /**
    * Tool names a model-direct call may be canonicalized into the equivalent
-   * `run_code` program. The list is fixed at mount; disable the row to turn
-   * the behavior off. Do not add long-running tools such as `workflow`: a
-   * converted call executes under `run_code`'s wall-clock ceiling.
+   * `run_code` program. The default `['*']` allows every tool; list real names
+   * to restrict, or use `[]` to disable the plugin. A listed name is also the
+   * only declaration another plugin may add to the wire view without disabling
+   * salvage. Long-running tools execute under `run_code`'s wall-clock ceiling,
+   * so list them out if that budget is too short for them.
    */
-  tools: z.array(z.string()).required(),
+  tools: z.array(z.string()).default([ALL_TOOLS]).description(
+    "Tools that may be called directly and translated into run_code. Default ['*'] allows every tool.",
+  ),
 })
 
 const RUN_CODE_NAME = 'run_code'
 const MAX_DIRECT_LITERAL_DEPTH = 128
 const PTC_ONLY_SECTION_NAME = 'tools:ptc-only'
-const DIRECT_WRITE_SECTION_NAME = 'tools:direct-write'
+const DIRECT_CALLS_SECTION_NAME = 'tools:direct-calls'
 
-/** The marker sentence the shipped instruction keeps across dsh minor versions. */
-const PTC_ONLY_MARKER = 'is the only tool you can call directly'
+/** Human-readable list for prompt text: "a", "a and b", or "a, b, and c". */
+function listedTools(allowed) {
+  const names = [...allowed].map(name => `\`${name}\``)
+  if (names.length === 1) return names[0]
+  if (names.length === 2) return `${names[0]} and ${names[1]}`
+  return `${names.slice(0, -1).join(', ')}, and ${names.at(-1)}`
+}
+
+/** The subject of a direct-call sentence: every tool, or the allowlisted names. */
+function directCallSubject(allowed) {
+  return allowed === undefined ? 'any tool' : listedTools(allowed)
+}
+
+/** Sentence-initial form of the subject. */
+function directCallSubjectSentence(allowed) {
+  const subject = directCallSubject(allowed)
+  return subject.charAt(0).toUpperCase() + subject.slice(1)
+}
+
+/** Named escaping cases; only the ones the allowlist permits are advertised. */
+const DIRECT_CALL_EXAMPLES = [
+  ['write', 'to create or fully replace a file'],
+  ['edit', 'for a targeted change'],
+  ['bash', 'for a command whose quoting you would otherwise have to escape inside a program'],
+]
+
+/** The concrete examples, naming only the tools the allowlist actually permits. */
+function directCallExamples(allowed) {
+  const permitted = DIRECT_CALL_EXAMPLES.filter(([name]) => allowed === undefined || allowed.has(name))
+  if (permitted.length === 0) return ''
+  const parts = permitted.map(([name, purpose], index) =>
+    `${index === 0 ? 'call ' : ''}\`${name}\` directly ${purpose}`)
+  const list = parts.length === 1
+    ? parts[0]
+    : `${parts.slice(0, -1).join(', ')}, and ${parts.at(-1)}`
+  return `In particular, ${list}. `
+}
 
 /**
- * Fallback amendment used when the shipped wording no longer contains
- * {@link PTC_ONLY_MARKER}. Kept as close to the shipped instruction as possible
- * so the rule's authority and the SDK pointer survive the amendment.
+ * The replacement for the shipped `tools:ptc-only` instruction. The shipped
+ * text promises that a direct call of any other tool fails; that is no longer
+ * true for the tools this plugin translates, so the whole instruction is
+ * restated while keeping the SDK pointer that follows it.
  */
-const PTC_ONLY_INSTRUCTION_WITH_DIRECT_WRITE =
-  '`run_code` is the only tool you can call directly, except `write`: a direct `write` call is ' +
-  'transparently translated into the equivalent `run_code` program (see Direct file writes below). ' +
-  'A tool call naming any other tool fails. Reach every tool the SDK declares below from inside the program.'
+function amendedPtcOnlyText(allowed) {
+  return `\`${RUN_CODE_NAME}\` is the tool for multi-step work. `
+    + `${directCallSubjectSentence(allowed)} may also be called directly: a direct call is `
+    + `transparently translated into the equivalent \`${RUN_CODE_NAME}\` program `
+    + '(see Direct tool calls below). Reach every tool the SDK declares below from inside a program, '
+    + 'or call one directly when that keeps its arguments readable.'
+}
 
 /**
- * Full advertising of the direct `write` call: behavior, why escaping is a
- * non-issue, the complete parameter list (mirroring the current `write`
- * schema, including the sandbox-escalation fields), and the boundaries —
- * every other tool stays inside a `run_code` program.
+ * The inserted advertising section: why escaping is a non-issue, when a direct
+ * call beats a program, and the boundary (multi-step work stays in a program).
+ * The tools' own parameters are already typed in the SDK section, so they are
+ * not repeated here.
  */
-const DIRECT_WRITE_SECTION_TEXT =
-  'Direct file writes: you may also call `write` directly — a direct `write` call is transparently ' +
-  'translated into the equivalent run_code program, and the file content is carried as a JSON argument ' +
-  'the harness embeds into the program mechanically, so it never has to be escaped into a JavaScript ' +
-  'string literal. Prefer a direct `write` call over a program that calls tools.write(...) whenever you ' +
-  'create or fully replace a file; it removes every escaping worry.\n' +
-  'Parameters of the direct `write` call:\n' +
-  '- file_path (string, required): path to write, resolved by the filesystem backend; relative paths resolve against the session working directory. Provide `file_path` before `content` in the arguments.\n' +
-  '- content (string, required): full UTF-8 text content to write; creates the file or fully replaces an existing one. Empty content is valid and writes an empty file.\n' +
-  '- sandbox_permissions (optional; present only when the deployment confines filesystem access, and then one of the deployment\'s escalation modes): the narrowest wider sandbox mode for a one-shot retry of the exact operation the sandbox just denied; the retry asks the user for approval.\n' +
-  '- justification (string, required with sandbox_permissions): one sentence for the user explaining why this exact file operation needs the wider access. Use the language of the user\'s current request.\n' +
-  'The result is a short confirmation with the resolved path and whether the file was created or updated; file content is not echoed back. ' +
-  'Read an existing file before overwriting it, and reach edit (or apply_patch, when the deployment mounts it) from inside a run_code program for targeted changes. ' +
-  'Every other tool is reachable only from inside a run_code program.'
+function directCallsText(allowed) {
+  return `Direct tool calls: you may call ${directCallSubject(allowed)} directly instead of writing `
+    + 'a `run_code` program for one invocation. A direct call is translated mechanically into the '
+    + 'equivalent program, with its arguments carried as JSON — they never pass through a JavaScript '
+    + 'string literal. Prefer a direct call whenever the arguments would be painful to escape in a '
+    + 'program: file contents, patches, code, prompts, or any text containing backticks, `${...}`, '
+    + 'quotes, or backslashes. '
+    + directCallExamples(allowed)
+    + 'A translated call is equivalent to the same call inside a program: argument validation, '
+    + 'sandbox, and approvals still apply. Use `run_code` for multi-step work and for tools whose '
+    + 'arguments are simple.'
+}
 
 function parseArguments(raw) {
   try {
@@ -249,14 +293,15 @@ function nativeCallCode(name, rawArgs, parsedArgs) {
  * other declared name is a tool the allowlist already governs. A second direct
  * tool another plugin presents therefore keeps salvage alive instead of
  * disabling it, while an unvetted extra (`bash`, `read`) or a malformed,
- * duplicated declaration leaves the stream untouched.
+ * duplicated declaration leaves the stream untouched. An unrestricted
+ * allowlist governs every name, so it accepts any well-formed view.
  */
 function acceptsTransportView(tools, allowed) {
   if (!Array.isArray(tools) || tools.length === 0) return false
   const names = tools.map(tool => tool?.name)
   if (names.includes(undefined) || new Set(names).size !== names.length) return false
   if (!names.includes(RUN_CODE_NAME)) return false
-  return names.every(name => name === RUN_CODE_NAME || allowed.has(name))
+  return names.every(name => name === RUN_CODE_NAME || allowed === undefined || allowed.has(name))
 }
 
 /**
@@ -270,19 +315,26 @@ function acceptsProgramTarget(options) {
 }
 
 /**
- * Resolve one emitted call name against the fixed allowlist without guessing.
- * A plain name and its `tools.`-prefixed form are different tools, so a name
- * that matches both is ambiguous and never resolves — the same refusal the
- * adapted canonicalizer applies to a schema-proven Map.
+ * Resolve one emitted call name to the program binding it names without
+ * guessing. `tools.`-qualified names map to their member; an explicit
+ * allowlist that contains both spellings as distinct tools never resolves an
+ * ambiguous name. `run_code` never resolves — it is the transport, not a
+ * binding — so an unrestricted allowlist cannot produce a program that calls
+ * `run_code` from inside itself.
  */
 function resolveAllowedName(name, allowed) {
   if (typeof name !== 'string' || name.length === 0) return undefined
+  const qualified = name.startsWith('tools.') ? name.slice('tools.'.length) : undefined
+  const member = qualified !== undefined && qualified.length > 0 && !qualified.includes('.')
+    ? qualified
+    : undefined
+  if (allowed === undefined) {
+    const resolved = member ?? name
+    return resolved === RUN_CODE_NAME ? undefined : resolved
+  }
   const matches = new Set()
   if (allowed.has(name)) matches.add(name)
-  if (name.startsWith('tools.')) {
-    const member = name.slice('tools.'.length)
-    if (member.length > 0 && !member.includes('.') && allowed.has(member)) matches.add(member)
-  }
+  if (member !== undefined && allowed.has(member)) matches.add(member)
   return matches.size === 1 ? matches.values().next().value : undefined
 }
 
@@ -402,10 +454,10 @@ function transformCandidates(chunks, indices, allowed, allowDeltaOnly = false) {
  * pass through unchanged for the host to diagnose.
  */
 export async function* canonicalizeToolCallStream(source, options = {}) {
-  const allowed = options.allowed instanceof Set
-    ? options.allowed
-    : new Set(Array.isArray(options.allowed) ? options.allowed : [])
-  if (allowed.size === 0 || !acceptsTransportView(options.tools, allowed)
+  const allowed = options.allowed === undefined ? undefined
+    : options.allowed instanceof Set ? options.allowed : new Set(options.allowed)
+  if ((allowed !== undefined && allowed.size === 0)
+    || !acceptsTransportView(options.tools, allowed)
     || !acceptsProgramTarget(options)) {
     yield* source
     return
@@ -494,15 +546,6 @@ export async function* canonicalizeToolCallStream(source, options = {}) {
  * the rest of its wording. Upstream text that no longer contains the marker
  * falls back to the pinned amendment.
  */
-function amendedPtcOnlyText(text) {
-  const at = text.indexOf(PTC_ONLY_MARKER)
-  if (at < 0) return PTC_ONLY_INSTRUCTION_WITH_DIRECT_WRITE
-  const end = at + PTC_ONLY_MARKER.length
-  return `${text.slice(0, end)}, except \`write\`: a direct \`write\` call is transparently `
-    + `translated into the equivalent \`${RUN_CODE_NAME}\` program (see Direct file writes below)`
-    + text.slice(end)
-}
-
 /**
  * Whether one assembly presents the PTC transport. The PTC executor owns the
  * `tools:ptc-only` section, and its text stays non-empty exactly while that
@@ -519,24 +562,24 @@ function presentsPtc(assembly) {
 }
 
 /**
- * Amend the shipped `tools:ptc-only` section and insert the advertising
+ * Restate the shipped `tools:ptc-only` instruction and insert the advertising
  * section after it. Non-PTC assemblies pass through untouched.
  */
-function advertiseDirectWrite(assembly, advertise) {
-  if (!advertise || !presentsPtc(assembly)) return assembly
+function advertiseDirectCalls(assembly, allowed) {
+  if (!presentsPtc(assembly)) return assembly
   const index = assembly.sections.findIndex(section => section.name === PTC_ONLY_SECTION_NAME)
   if (index < 0) return assembly
   const sections = assembly.sections.map(section => (
     section.name === PTC_ONLY_SECTION_NAME
-      ? { ...section, text: amendedPtcOnlyText(section.text) }
+      ? { ...section, text: amendedPtcOnlyText(allowed) }
       : section
   ))
-  if (sections.some(section => section.name === DIRECT_WRITE_SECTION_NAME)) {
+  if (sections.some(section => section.name === DIRECT_CALLS_SECTION_NAME)) {
     return { ...assembly, sections }
   }
   sections.splice(index + 1, 0, {
-    name: DIRECT_WRITE_SECTION_NAME,
-    text: DIRECT_WRITE_SECTION_TEXT,
+    name: DIRECT_CALLS_SECTION_NAME,
+    text: directCallsText(allowed),
     interpolate: false,
   })
   return { ...assembly, sections }
@@ -563,20 +606,21 @@ function runtimeTarget(ctx) {
 }
 
 /**
- * Observe the global LLM stream and canonicalize allowlisted direct calls,
- * and advertise the direct `write` call in PTC prompt assemblies.
+ * Observe the global LLM stream and canonicalize direct calls, and advertise
+ * them in PTC prompt assemblies.
  * @param ctx - the mounting context.
- * @param config - the allowlist of tool names.
+ * @param config - the optional allowlist; omitted means every tool.
  */
 export function apply(ctx, config) {
-  const allowed = new Set(config.tools)
-  const advertiseWrite = allowed.has('write')
+  const configured = config.tools ?? [ALL_TOOLS]
+  const allowed = configured.includes(ALL_TOOLS) ? undefined : new Set(configured)
+  const hasDirectCalls = allowed === undefined || allowed.size > 0
   ctx.on('llm/stream', (options, next) => canonicalizeToolCallStream(next(), {
     tools: options?.tools,
     allowed,
     ...runtimeTarget(ctx),
   }), { global: true })
   ctx.on('system-prompt/assemble', (assembly, _context, next) => (
-    next().then(assembled => advertiseDirectWrite(assembled, advertiseWrite))
+    next().then(assembled => hasDirectCalls ? advertiseDirectCalls(assembled, allowed) : assembled)
   ))
 }

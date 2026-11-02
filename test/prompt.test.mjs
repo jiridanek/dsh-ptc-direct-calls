@@ -43,110 +43,115 @@ function section(out, name) {
   return out.sections.find(s => s.name === name)
 }
 
-// 1. PTC marker present: instruction amended and the advertising inserted after it
+// 1. Unrestricted (no tools config): any tool is advertised, write/edit named
 {
   const ctx = makeCtx(undefined)
-  apply(ctx, { tools: ['write'] })
+  apply(ctx, {})
   const assemble = assembleOf(ctx)
   const out = await assemble.handler(null, { scope: 'agent1' }, async () => PTC_ASSEMBLY())
   const ptcOnly = section(out, 'tools:ptc-only')
-  assert.ok(ptcOnly.text.includes('except `write`'), 'ptc-only instruction amended')
-  assert.ok(ptcOnly.text.includes('a tool call naming any other tool fails.'), 'upstream wording retained')
+  assert.ok(ptcOnly.text.includes('Any tool may also be called directly'), ptcOnly.text)
+  assert.ok(!ptcOnly.text.includes('a tool call naming any other tool fails'), 'false claim removed')
   assert.ok(ptcOnly.text.includes('Reach every tool the SDK declares below'), 'SDK pointer retained')
-  const direct = section(out, 'tools:direct-write')
+  const direct = section(out, 'tools:direct-calls')
   assert.ok(direct, 'advertising section inserted')
   assert.equal(direct.interpolate, false)
-  assert.equal(out.sections[1].name, 'tools:direct-write', 'inserted right after the amendment')
-  assert.ok(direct.text.includes('Direct file writes'), 'advertises the direct call')
-  assert.ok(direct.text.includes('file_path (string, required)'), 'advertises file_path')
-  assert.ok(direct.text.includes('content (string, required)'), 'advertises content')
-  assert.ok(direct.text.includes('sandbox_permissions'), 'advertises sandbox_permissions')
-  assert.ok(direct.text.includes('justification'), 'advertises justification')
-  assert.ok(direct.text.includes('Every other tool is reachable only from inside a run_code program'))
+  assert.equal(out.sections[1].name, 'tools:direct-calls', 'inserted right after the amendment')
+  assert.ok(direct.text.includes('Direct tool calls'), 'advertises direct calls')
+  assert.ok(direct.text.includes('any tool directly'), 'unrestricted subject')
+  assert.ok(direct.text.includes('backticks'), 'names escaping-sensitive text')
+  assert.ok(direct.text.includes('${...}'), 'names template interpolation')
+  assert.ok(direct.text.includes('call `write` directly'), 'names write')
+  assert.ok(direct.text.includes('`edit` directly'), 'names edit')
+  assert.ok(direct.text.includes('`bash` directly'), 'names bash')
+  assert.ok(direct.text.includes('argument validation, sandbox, and approvals still apply'))
   assert.equal(section(out, 'tools:sdk').text, 'sdk...', 'other sections untouched')
-  console.log('1. PTC assembly amended + advertising inserted: OK')
+  console.log('1. unrestricted advertising: OK')
 }
 
-// 2. Native assembly (executor-owned marker renders empty): identity passthrough
-{
-  const ctx = makeCtx(undefined)
-  apply(ctx, { tools: ['write'] })
-  const assemble = assembleOf(ctx)
-  const native = NATIVE_ASSEMBLY()
-  const out = await assemble.handler(null, { scope: 'agent2' }, async () => native)
-  assert.equal(out, native, 'non-PTC assembly passed through by identity')
-  assert.equal(section(out, 'tools:direct-write'), undefined, 'no advertising in native mode')
-  console.log('2. native assembly untouched: OK')
-}
-
-// 3. write not in the allowlist: no amendment, no advertising
+// 2. Restricted allowlist: text names exactly the permitted tools
 {
   const ctx = makeCtx(undefined)
   apply(ctx, { tools: ['edit'] })
-  const assemble = assembleOf(ctx)
-  const out = await assemble.handler(null, { scope: 'agent3' }, async () => PTC_ASSEMBLY())
-  assert.equal(section(out, 'tools:ptc-only').text, PTC_ONLY_TEXT, 'shipped instruction kept')
-  assert.equal(section(out, 'tools:direct-write'), undefined, 'no advertising')
-  console.log('3. write not allowlisted: advertising off: OK')
+  const direct = section(await assembleOf(ctx).handler(null, { scope: 'agent2' }, async () => PTC_ASSEMBLY()), 'tools:direct-calls')
+  assert.ok(direct.text.includes('call `edit` directly'), direct.text)
+  assert.ok(!direct.text.includes('`write`'), 'write not advertised')
+  assert.ok(!direct.text.includes('`bash`'), 'bash not advertised')
+  assert.ok(!direct.text.includes('any tool'), 'no unrestricted claim')
+  console.log('2. restricted allowlist advertising: OK')
 }
 
-// 4. No ptc-only section at all: untouched
+// 3. Several allowlisted tools are listed readably
 {
   const ctx = makeCtx(undefined)
-  apply(ctx, { tools: ['write'] })
+  apply(ctx, { tools: ['write', 'edit', 'bash'] })
+  const out = await assembleOf(ctx).handler(null, { scope: 'agent3' }, async () => PTC_ASSEMBLY())
+  assert.ok(section(out, 'tools:ptc-only').text.includes('`write`, `edit`, and `bash` may also be called directly'))
+  const direct = section(out, 'tools:direct-calls').text
+  for (const name of ['write', 'edit', 'bash']) assert.ok(direct.includes(`\`${name}\``), name)
+  console.log('3. multiple allowlisted tools listed: OK')
+}
+
+// 4. Empty allowlist: nothing is advertised and the shipped instruction stands
+{
+  const ctx = makeCtx(undefined)
+  apply(ctx, { tools: [] })
   const assemble = assembleOf(ctx)
+  const assembly = PTC_ASSEMBLY()
+  const out = await assemble.handler(null, { scope: 'agent4' }, async () => assembly)
+  assert.equal(out, assembly, 'assembly passed through by identity')
+  console.log('4. empty allowlist advertises nothing: OK')
+}
+
+// 5. Native assembly (executor-owned marker renders empty): identity passthrough
+{
+  const ctx = makeCtx(undefined)
+  apply(ctx, {})
+  const native = NATIVE_ASSEMBLY()
+  const out = await assembleOf(ctx).handler(null, { scope: 'agent5' }, async () => native)
+  assert.equal(out, native, 'non-PTC assembly passed through by identity')
+  assert.equal(section(out, 'tools:direct-calls'), undefined, 'no advertising in native mode')
+  console.log('5. native assembly untouched: OK')
+}
+
+// 6. No ptc-only section at all: untouched
+{
+  const ctx = makeCtx(undefined)
+  apply(ctx, {})
   const custom = { sections: [{ name: 'deployment:persona-prefix', text: 'hi' }], contexts: [], variables: {} }
-  const out = await assemble.handler(null, { scope: 'agent4' }, async () => custom)
+  const out = await assembleOf(ctx).handler(null, { scope: 'agent6' }, async () => custom)
   assert.equal(out, custom, 'assembly without the PTC marker passed through by identity')
-  console.log('4. assembly without PTC marker untouched: OK')
+  console.log('6. assembly without PTC marker untouched: OK')
 }
 
-// 5. Another listener already inserted the advertising: amended, not duplicated
+// 7. Another listener already inserted the advertising: restated, not duplicated
 {
   const ctx = makeCtx(undefined)
-  apply(ctx, { tools: ['write'] })
-  const assemble = assembleOf(ctx)
+  apply(ctx, {})
   const withDirect = {
     sections: [
       { name: 'tools:ptc-only', text: PTC_ONLY_TEXT },
-      { name: 'tools:direct-write', text: 'someone else' },
+      { name: 'tools:direct-calls', text: 'someone else' },
     ],
     contexts: [],
     variables: {},
   }
-  const out = await assemble.handler(null, { scope: 'agent5' }, async () => withDirect)
-  assert.equal(out.sections.filter(s => s.name === 'tools:direct-write').length, 1, 'no duplicate section')
-  assert.equal(section(out, 'tools:direct-write').text, 'someone else', 'existing section left alone')
-  assert.ok(section(out, 'tools:ptc-only').text.includes('except `write`'))
-  console.log('5. existing advertising section not duplicated: OK')
+  const out = await assembleOf(ctx).handler(null, { scope: 'agent7' }, async () => withDirect)
+  assert.equal(out.sections.filter(s => s.name === 'tools:direct-calls').length, 1, 'no duplicate section')
+  assert.equal(section(out, 'tools:direct-calls').text, 'someone else', 'existing section left alone')
+  assert.ok(section(out, 'tools:ptc-only').text.includes('Any tool'))
+  console.log('7. existing advertising section not duplicated: OK')
 }
 
-// 6. Upstream wording without the marker: pinned fallback amendment
+// 8. Both listeners are registered, the stream one globally
 {
   const ctx = makeCtx(undefined)
-  apply(ctx, { tools: ['write'] })
-  const assemble = assembleOf(ctx)
-  const reworded = {
-    sections: [{ name: 'tools:ptc-only', text: '`run_code` is the only directly callable tool.' }],
-    contexts: [],
-    variables: {},
-  }
-  const out = await assemble.handler(null, { scope: 'agent6' }, async () => reworded)
-  const text = section(out, 'tools:ptc-only').text
-  assert.ok(text.includes('except `write`'), 'fallback amendment applied')
-  assert.ok(text.includes('Reach every tool the SDK declares below'), 'fallback keeps the SDK pointer')
-  console.log('6. reworded upstream instruction falls back: OK')
-}
-
-// 7. Both listeners are registered, the stream one globally
-{
-  const ctx = makeCtx(undefined)
-  apply(ctx, { tools: ['write'] })
+  apply(ctx, {})
   const stream = ctx.__handlers.find(h => h.event === 'llm/stream')
   assert.ok(stream, 'llm/stream listener registered')
   assert.equal(stream.opts?.global, true, 'llm/stream listener is global')
   assert.equal(ctx.__handlers.length, 2, 'no section registration')
-  console.log('7. listeners registered at the right scope: OK')
+  console.log('8. listeners registered at the right scope: OK')
 }
 
-console.log('\nAll 7 prompt tests passed.')
+console.log('\nAll 8 prompt tests passed.')

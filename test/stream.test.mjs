@@ -349,4 +349,46 @@ function transformedArgs(out) {
   console.log('24. declared allowlisted tool canonicalized: OK')
 }
 
-console.log('\nAll 24 tests passed.')
+// 25. Unrestricted allowlist canonicalizes any tool, in any well-formed view
+{
+  const raw = JSON.stringify({ command: 'ls' })
+  const direct = [...writeCallChunks(raw, { name: 'bash', id: 'call_25' }), { type: 'finish', reason: 'stop' }]
+  const out = await collect(of(direct), { tools: PTC })
+  assert.ok(transformedArgs(out).code.includes('tools.bash('))
+  const mixed = [...writeCallChunks(raw, { name: 'bash', id: 'call_25b' }), { type: 'finish', reason: 'stop' }]
+  const mixedOut = await collect(of(mixed), { tools: [{ name: 'run_code' }, { name: 'read' }] })
+  assert.ok(transformedArgs(mixedOut).code.includes('tools.bash('), 'a second declared tool no longer disables salvage')
+  const qualified = [...writeCallChunks(raw, { name: 'tools.bash', id: 'call_25c' }), { type: 'finish', reason: 'stop' }]
+  assert.ok(transformedArgs(await collect(of(qualified), { tools: PTC })).code.includes('tools.bash('))
+  console.log('25. unrestricted allowlist canonicalizes any tool: OK')
+}
+
+// 26. The transport itself is never nested back into a program
+{
+  const raw = JSON.stringify({ code: 'return 1', description: 'one' })
+  for (const name of ['run_code', 'tools.run_code']) {
+    const input = [...writeCallChunks(raw, { name, id: 'call_26' }), { type: 'finish', reason: 'stop' }]
+    assert.deepEqual(await collect(of(input), { tools: PTC }), input, `${name} must not be rewritten`)
+  }
+  console.log('26. run_code is never rewritten: OK')
+}
+
+// 27. apply() defaults to every tool, by omission or by the '*' entry
+{
+  for (const config of [{}, { tools: ['*'] }]) {
+    const handlers = []
+    const ctx = {
+      on: (event, handler) => { handlers.push({ event, handler }); return () => {} },
+      get: () => undefined,
+    }
+    apply(ctx, config)
+    const stream = handlers.find(h => h.event === 'llm/stream').handler
+    const raw = JSON.stringify({ command: 'ls' })
+    const source = [...writeCallChunks(raw, { name: 'bash', id: 'call_27' }), { type: 'finish', reason: 'stop' }]
+    const out = await collect(stream({ tools: PTC }, () => of(source)), {})
+    assert.ok(transformedArgs(out).code.includes('tools.bash('), JSON.stringify(config))
+  }
+  console.log('27. apply() defaults to every tool: OK')
+}
+
+console.log('\nAll 27 tests passed.')

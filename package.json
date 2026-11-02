@@ -1,6 +1,6 @@
 {
   "name": "dsh-ptc-direct-calls",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "DSH profile plugin: canonicalize stray direct write calls to run_code in PTC sessions and advertise the direct call in the prompt",
   "license": "MIT",
   "type": "module",
